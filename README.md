@@ -1,6 +1,6 @@
 <img src="./imagen.png" width="450px"></img>
 
-## Imagen - Pytorch (wip)
+## Imagen - Pytorch
 
 Implementation of <a href="https://gweb-research-imagen.appspot.com/">Imagen</a>, Google's Text-to-Image Neural Network that beats DALL-E2, in Pytorch. It is the new SOTA for text-to-image synthesis.
 
@@ -51,7 +51,7 @@ imagen = Imagen(
     image_sizes = (64, 256),
     beta_schedules = ('cosine', 'linear'),
     timesteps = 1000,
-    cond_drop_prob = 0.5
+    cond_drop_prob = 0.1
 ).cuda()
 
 # mock images (get a lot of this) and text encodings from large T5
@@ -73,9 +73,32 @@ images = imagen.sample(texts = [
     'a whale breaching from afar',
     'young girl blowing out candles on her birthday cake',
     'fireworks with blue and green sparkles'
-], cond_scale = 2.)
+], cond_scale = 3.)
 
 images.shape # (3, 3, 256, 256)
+```
+
+For simpler training, you can directly supply text strings instead of precomputing text encodings. (Although for scaling purposes, you will definitely want to precopmute the textual embeddings + mask)
+
+The number of textual captions must match the batch size of the images if you go this route.
+
+```python
+# mock images and text (get a lot of this)
+
+texts = [
+    'a child screaming at finding a worm within a half-eaten apple',
+    'lizard running across the desert on two feet',
+    'waking up to a psychedelic landscape',
+    'seashells sparkling in the shallow waters'
+]
+
+images = torch.randn(4, 3, 256, 256).cuda()
+
+# feed images into imagen, training each unet in the cascade
+
+for i in (1, 2):
+    loss = imagen(images, texts = texts, unet_number = i)
+    loss.backward()
 ```
 
 With the `ImagenTrainer` wrapper class, the exponential moving averages for all of the U-nets in the cascading DDPM will be automatically taken care of when calling `update`
@@ -111,7 +134,7 @@ imagen = Imagen(
     image_sizes = (64, 256),
     beta_schedules = ('cosine', 'linear'),
     timesteps = 1000,
-    cond_drop_prob = 0.5
+    cond_drop_prob = 0.1
 ).cuda()
 
 # wrap imagen with the trainer class
@@ -143,9 +166,76 @@ for i in (1, 2):
 images = trainer.sample(texts = [
     'a puppy looking anxiously at a giant donut on the table',
     'the milky way galaxy in the style of monet'
-], cond_scale = 2.)
+], cond_scale = 3.)
 
 images.shape # (2, 3, 256, 256)
+```
+
+You can also train Imagen without text (unconditional image generation) as follows
+
+```python
+import torch
+from imagen_pytorch import Unet, Imagen, SRUnet256, ImagenTrainer
+
+# unets for unconditional imagen
+
+unet1 = Unet(
+    dim = 32,
+    dim_mults = (1, 2, 4),
+    num_resnet_blocks = 3,
+    layer_attns = (False, True, True),
+    layer_cross_attns = (False, True, True),
+    use_linear_attn = True
+)
+
+unet2 = SRUnet256(
+    dim = 32,
+    dim_mults = (1, 2, 4),
+    num_resnet_blocks = (2, 4, 8),
+    layer_attns = (False, False, True),
+    layer_cross_attns = (False, False, True)
+)
+
+# imagen, which contains the unets above (base unet and super resoluting ones)
+
+imagen = Imagen(
+    condition_on_text = False,   # this must be set to False for unconditional Imagen
+    unets = (unet1, unet2),
+    image_sizes = (64, 128),
+    beta_schedules = ('cosine', 'linear'),
+    timesteps = 1000
+)
+
+trainer = ImagenTrainer(imagen).cuda()
+
+# now get a ton of images and feed it through the Imagen trainer
+
+training_images = torch.randn(4, 3, 256, 256).cuda()
+
+# train each unet in concert, or separately (recommended) to completion
+
+for u in (1, 2):
+    loss = trainer(training_images, unet_number = u)
+    trainer.update(unet_number = u)
+
+# do the above for many many many many steps
+# now you can sample images unconditionally from the cascading unet(s)
+
+images = trainer.sample(batch_size = 16) # (16, 3, 128, 128)
+```
+
+## FAQ
+
+- Why are my generated images not aligning well with the text?
+
+Imagen uses an algorithm called <a href="https://openreview.net/forum?id=qw8AKxfYbI">Classifier Free Guidance</a>. When sampling, you apply a scale to the conditioning (text in this case) of greater than `1.0`.
+
+Researcher <a href="https://github.com/Netruk44 ">Netruk44</a> have reported `5-10` to be optimal, but anything greater than `10` to break.
+
+```python
+trainer.sample(texts = [
+    'a cloud in the shape of a roman gladiator'
+], cond_scale = 5.) # <-- cond_scale is the conditioning scale, needs to be greater than 1.0 to be better than average
 ```
 
 ## Shoutouts
@@ -176,10 +266,19 @@ images.shape # (2, 3, 256, 256)
 - [x] consider using perceiver-resampler from https://github.com/lucidrains/flamingo-pytorch in place of attention pooling
 - [x] add attention pooling option, in addition to cross attention and film
 - [x] add optional cosine decay schedule with warmup, for each unet, to trainer
-- [ ] figure out if learned variance was used at all, and remove it if it was inconsequential
-- [ ] switch to continuous timesteps instead of discretized, as it seems that is what they used for all stages - first figure out the linear noise schedule case from the variational ddpm paper https://openreview.net/forum?id=2LdBqxc1Yv
-- [ ] exercise efficient attention expertise + explore skip layer excitation
-- [ ] try out grid attention
+- [x] switch to continuous timesteps instead of discretized, as it seems that is what they used for all stages - first figure out the linear noise schedule case from the variational ddpm paper https://openreview.net/forum?id=2LdBqxc1Yv
+- [x] figure out log(snr) for alpha cosine noise schedule.
+- [x] suppress the transformers warning because only T5encoder is used
+- [x] allow setting for using linear attention on layers where full attention cannot be used
+- [x] force unets in continuous time case to use non-fouriered conditions (just pass the log(snr) through an MLP with optional layernorms), as that is what i have working locally
+- [x] removed learned variance
+- [x] add p2 loss weighting for continuous time
+- [x] make sure cascading ddpm can be trained without text condition, and make sure both continuous and discrete time gaussian diffusion works
+- [x] use primer's depthwise convs on the qkv projections in linear attention (or use token shifting before projections) - also use new dropout proposed by bayesformer, as it seems to work well with linear attention
+- [ ] explore skip layer excitation in unet decoder
+- [ ] take care of huggingface accelerate integration
+- [ ] build out CLI tool for training, resuming training, and one-line generation of image
+- [ ] extend to video generation, using axial time attention as in Ho's video ddpm paper
 
 ## Citations
 
@@ -192,18 +291,37 @@ images.shape # (2, 3, 256, 256)
 ```
 
 ```bibtex
-@inproceedings{Tu2022MaxViTMV,
-    title   = {MaxViT: Multi-Axis Vision Transformer},
-    author  = {Zhengzhong Tu and Hossein Talebi and Han Zhang and Feng Yang and Peyman Milanfar and Alan Conrad Bovik and Yinxiao Li},
-    year    = {2022},
-    url     = {https://arxiv.org/abs/2204.01697}
-}
-```
-
-```bibtex
 @article{Alayrac2022Flamingo,
     title   = {Flamingo: a Visual Language Model for Few-Shot Learning},
     author  = {Jean-Baptiste Alayrac et al},
     year    = {2022}
+}
+```
+
+```bibtex
+@article{Choi2022PerceptionPT,
+    title   = {Perception Prioritized Training of Diffusion Models},
+    author  = {Jooyoung Choi and Jungbeom Lee and Chaehun Shin and Sungwon Kim and Hyunwoo J. Kim and Sung-Hoon Yoon},
+    journal = {ArXiv},
+    year    = {2022},
+    volume  = {abs/2204.00227}
+}
+```
+
+```bibtex
+@inproceedings{Sankararaman2022BayesFormerTW,
+    title   = {BayesFormer: Transformer with Uncertainty Estimation},
+    author  = {Karthik Abinav Sankararaman and Sinong Wang and Han Fang},
+    year    = {2022}
+}
+```
+
+```bibtex
+@article{So2021PrimerSF,
+    title   = {Primer: Searching for Efficient Transformers for Language Modeling},
+    author  = {David R. So and Wojciech Ma'nke and Hanxiao Liu and Zihang Dai and Noam M. Shazeer and Quoc V. Le},
+    journal = {ArXiv},
+    year    = {2021},
+    volume  = {abs/2109.08668}
 }
 ```
